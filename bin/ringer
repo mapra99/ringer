@@ -1,0 +1,821 @@
+#!/bin/zsh
+# ringer: call a number from the macOS Phone app, optionally on a schedule,
+# and speak a message into the call once someone answers.
+
+emulate -R zsh
+setopt pipe_fail extended_glob
+
+RINGER_VERSION=0.1.0
+RINGER_SELF=${0:A}
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/ringer
+CONFIG_FILE=$CONFIG_DIR/config
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/ringer
+JOBS_DIR=$STATE_DIR/jobs
+LOG_FILE=$STATE_DIR/ringer.log
+SAS=${RINGER_SAS:-$(command -v SwitchAudioSource || print /opt/homebrew/bin/SwitchAudioSource)}
+
+typeset -A cfg=(
+	mic ""
+	speaker ""
+	call_output ""
+	voice ""
+	repeat 3
+	pause 2
+	answer_timeout 60
+	attempts 3
+	ui_call_button Call
+	ui_end_button End
+)
+CONFIG_KEYS=(mic speaker call_output voice repeat pause answer_timeout attempts ui_call_button ui_end_button)
+
+AUDIO_SAVED=0
+TMP_FILES=()
+
+# ---------- helpers ----------
+
+die() { print -ru2 -- "ringer: $*"; exit 1 }
+warn() { print -ru2 -- "ringer: $*" }
+
+log() {
+	local line="$(date '+%F %T') $*"
+	mkdir -p $STATE_DIR
+	print -r -- "$line" >> $LOG_FILE
+	[[ -n ${RINGER_QUIET:-} ]] || print -r -- "$line"
+}
+
+is_uint() { [[ $1 == <-> ]] }
+
+# Calls `$2 key value` for every `key = value` line in file $1. Blank lines and # comments are skipped.
+parse_kv() {
+	local file=$1 callback=$2 line
+	[[ -r $file ]] || return 0
+	while IFS= read -r line || [[ -n $line ]]; do
+		[[ $line == [[:space:]]#(\#*|) ]] && continue
+		if [[ $line =~ '^[[:space:]]*([A-Za-z_]+)[[:space:]]*=[[:space:]]*(.*)$' ]]; then
+			local key=$match[1] value=${match[2]%%[[:space:]]#}
+			[[ $value == \"*\" ]] && value=${${value#\"}%\"}
+			$callback $key $value
+		else
+			warn "ignoring malformed line in $file: $line"
+		fi
+	done < $file
+}
+
+set_cfg() {
+	if (( ${CONFIG_KEYS[(Ie)$1]} )); then
+		cfg[$1]=$2
+	else
+		warn "unknown config key '$1'"
+	fi
+}
+
+load_config() { parse_kv $CONFIG_FILE set_cfg }
+
+write_config() {
+	mkdir -p $CONFIG_DIR
+	{
+		print "# ringer config. Written by 'ringer setup'; safe to edit by hand."
+		local key
+		for key in $CONFIG_KEYS; do
+			print -r -- "$key = \"$cfg[$key]\""
+		done
+	} > $CONFIG_FILE
+}
+
+# Strips formatting from a phone number. Prints nothing and fails if it doesn't look like one.
+normalize_number() {
+	local n=${1//[[:space:]().-]/}
+	[[ $n =~ '^\+?[0-9]{3,15}$' ]] || return 1
+	print -r -- $n
+}
+
+# Converts "HH:MM", "YYYY-MM-DD HH:MM" or "YYYY-MM-DDTHH:MM" to epoch seconds.
+# A bare HH:MM means its next occurrence, or that time on $2 (YYYY-MM-DD) when given.
+parse_when() {
+	local when=$1 anchor=${2:-} now=${RINGER_NOW:-$(date +%s)} day hh mm epoch
+	if [[ $when =~ '^([0-9]{1,2}):([0-9]{2})$' ]]; then
+		hh=$match[1] mm=$match[2]
+		day=${anchor:-$(date -r $now +%F)}
+	elif [[ $when =~ '^([0-9]{4}-[0-9]{2}-[0-9]{2})[T ]([0-9]{1,2}):([0-9]{2})$' ]]; then
+		day=$match[1] hh=$match[2] mm=$match[3]
+	else
+		return 1
+	fi
+	(( 10#$hh < 24 && 10#$mm < 60 )) || return 1
+	hh=${(l:2::0:)$(( 10#$hh ))}
+	epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$day $hh:$mm:00" +%s 2>/dev/null) || return 1
+	# date -j rolls invalid days over (Feb 30 becomes Mar 2), so check it round-trips.
+	[[ $(date -r $epoch +%F) == $day ]] || return 1
+	if (( epoch <= now )) && [[ $when != *-* && -z $anchor ]]; then
+		day=$(date -r $now -v+1d +%F)
+		epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$day $hh:$mm:00" +%s)
+	fi
+	print -r -- $epoch
+}
+
+fmt_time() { date -r $1 '+%a %d %b %H:%M' }
+
+# ---------- accessibility / UI scripting ----------
+
+AX_LIB='
+on findBtn(e, depth, label)
+	tell application "System Events"
+		try
+			if role of e is "AXButton" and description of e is label then return e
+		end try
+		if depth < 15 then
+			try
+				repeat with c in (UI elements of e)
+					set r to my findBtn(c, depth + 1, label)
+					if r is not missing value then return r
+				end repeat
+			end try
+		end if
+	end tell
+	return missing value
+end findBtn
+
+on callText(e, depth)
+	tell application "System Events"
+		try
+			if role of e is "AXGenericElement" then
+				set d to description of e as text
+				if d contains "iPhone" then return d
+			end if
+		end try
+		if depth < 15 then
+			try
+				repeat with c in (UI elements of e)
+					set r to my callText(c, depth + 1)
+					if r is not "" then return r
+				end repeat
+			end try
+		end if
+	end tell
+	return ""
+end callText
+
+on ncWindow()
+	tell application "System Events" to return window "Notification Center" of process "NotificationCenter"
+end ncWindow
+'
+
+# Runs an AppleScript body (which defines `on run argv`) with the handlers above. Extra args become argv.
+ax() {
+	local body=$1; shift
+	print -r -- "$AX_LIB"$'\n'"$body" | osascript - "$@" 2>/dev/null
+}
+
+has_accessibility() {
+	osascript -e 'tell application "System Events" to count UI elements of process "Dock"' >/dev/null 2>&1
+}
+
+press_button() {
+	[[ $(ax '
+on run argv
+	tell application "System Events"
+		try
+			set b to my findBtn(my ncWindow(), 0, item 1 of argv)
+			if b is not missing value then
+				perform action "AXPress" of b
+				return "pressed"
+			end if
+		end try
+	end tell
+	return ""
+end run' "$1") == pressed ]]
+}
+
+# Prints the call banner text, e.g. "+1 (555) 555-0199, using your iPhone - , 0:03". Empty when no call.
+call_status() {
+	ax '
+on run argv
+	tell application "System Events"
+		try
+			return my callText(my ncWindow(), 0)
+		end try
+	end tell
+	return ""
+end run'
+}
+
+# Prints "sheet" if Phone is showing an alert such as "Call Failed". With "dismiss", also closes it.
+phone_sheet() {
+	ax '
+on run argv
+	tell application "System Events"
+		try
+			tell process "Phone"
+				if exists sheet 1 of window 1 then
+					if (count of argv) > 0 and item 1 of argv is "dismiss" then click button 1 of sheet 1 of window 1
+					return "sheet"
+				end if
+			end tell
+		end try
+	end tell
+	return ""
+end run' "$@"
+}
+
+# Picks an entry under Video > Microphone in the Phone app. Best effort: the menu is localized.
+phone_mic() {
+	ax '
+on run argv
+	set wanted to item 1 of argv
+	tell application "System Events"
+		try
+			tell process "Phone"
+				set its_items to menu items of menu 1 of menu bar item "Video" of menu bar 1
+				set inMic to false
+				repeat with k from 1 to count of its_items
+					set n to ""
+					try
+						set n to name of item k of its_items as text
+					end try
+					if n is "Microphone" then set inMic to true
+					if n is "Output" then exit repeat
+					if inMic and n is wanted then
+						click item k of its_items
+						return "ok"
+					end if
+				end repeat
+			end tell
+		end try
+	end tell
+	return ""
+end run' "$1" >/dev/null
+}
+
+# ---------- audio devices ----------
+
+require_sas() {
+	[[ -x $SAS ]] || die "SwitchAudioSource not found. Install it with: brew install switchaudio-osx"
+}
+
+list_devices() { $SAS -a -t $1 2>/dev/null }
+
+device_exists() { list_devices $1 | grep -Fxq -- "$2" }
+
+get_volume() { osascript -e 'output volume of (get volume settings)' 2>/dev/null }
+
+set_volume() { [[ $1 == <-> ]] && osascript -e "set volume output volume $1" >/dev/null 2>&1 }
+
+prepare_audio() {
+	[[ -n $cfg[mic] && -n $cfg[speaker] ]] || { log "no mic or speaker configured, run 'ringer setup'"; return 1 }
+	device_exists input "$cfg[mic]" || { log "microphone '$cfg[mic]' is not connected"; return 1 }
+	device_exists output "$cfg[speaker]" || { log "speaker '$cfg[speaker]' is not connected"; return 1 }
+
+	saved_input=$($SAS -c -t input)
+	saved_output=$($SAS -c -t output)
+	saved_output_volume=$(get_volume)
+
+	$SAS -t output -s "$cfg[speaker]" >/dev/null
+	saved_speaker_volume=$(get_volume)
+	set_volume 100
+
+	local call_out=${cfg[call_output]:-$saved_output}
+	if [[ $call_out == "$cfg[speaker]" ]] || ! device_exists output "$call_out"; then
+		call_out=$(list_devices output | grep -Fxv -- "$cfg[speaker]" | head -1)
+		log "call audio moved to '$call_out' so it doesn't drown out the message"
+	fi
+	$SAS -t output -s "$call_out" >/dev/null
+	$SAS -t input -s "$cfg[mic]" >/dev/null
+	open -g -a Phone
+	sleep 1
+	phone_mic "$cfg[mic]"
+	AUDIO_SAVED=1
+}
+
+restore_audio() {
+	(( AUDIO_SAVED )) || return 0
+	$SAS -t output -s "$cfg[speaker]" >/dev/null 2>&1 && set_volume $saved_speaker_volume
+	$SAS -t output -s "$saved_output" >/dev/null 2>&1 && set_volume $saved_output_volume
+	$SAS -t input -s "$saved_input" >/dev/null 2>&1
+	phone_mic "Use System Setting"
+	AUDIO_SAVED=0
+}
+
+# ---------- calling ----------
+
+# Waits until the banner shows a running call timer. Returns 0 answered, 1 failed, 2 timed out.
+wait_answer() {
+	local deadline=$(( $(date +%s) + cfg[answer_timeout] )) st prev=""
+	while (( $(date +%s) < deadline )); do
+		[[ -n $(phone_sheet) ]] && return 1
+		st=$(call_status)
+		if [[ $st != $prev ]]; then
+			[[ -n $st ]] && log "status: $st"
+			prev=$st
+		fi
+		[[ $st =~ '[0-9]+:[0-9]{2}' ]] && return 0
+		sleep 0.5
+	done
+	return 2
+}
+
+play_message() {
+	local file=$1 n
+	local -a vopt
+	[[ -n $cfg[voice] ]] && vopt=(-v $cfg[voice])
+	sleep 1.5
+	for n in {1..$cfg[repeat]}; do
+		[[ -n $(call_status) ]] || { log "call ended during the message"; return 0 }
+		log "playing message ($n/$cfg[repeat])"
+		say $vopt -a "$cfg[speaker]" -f "$file" || log "say failed, check the voice and speaker settings"
+		sleep $cfg[pause]
+	done
+}
+
+# Dials $1. With a message file in $2, waits for an answer, speaks it, then hangs up.
+do_call() {
+	local number=$1 msg=${2:-} attempt i rc
+	{
+		if [[ -n $msg ]]; then
+			prepare_audio || return 1
+		fi
+		for attempt in {1..$cfg[attempts]}; do
+			log "calling $number (attempt $attempt/$cfg[attempts])"
+			phone_sheet dismiss >/dev/null
+			caffeinate -u -t 2 &!
+			open "tel://$number"
+
+			local pressed=0
+			for i in {1..20}; do
+				press_button "$cfg[ui_call_button]" && { pressed=1; break }
+				sleep 0.5
+			done
+			if (( ! pressed )); then
+				log "the '$cfg[ui_call_button]' button never appeared"
+				sleep 10
+				continue
+			fi
+
+			if [[ -z $msg ]]; then
+				for i in {1..16}; do
+					[[ -n $(phone_sheet) ]] && break
+					[[ -n $(call_status) ]] && { log "call placed"; return 0 }
+					sleep 0.5
+				done
+				[[ -z $(phone_sheet) ]] && { log "call placed"; return 0 }
+				log "call failed"
+				phone_sheet dismiss >/dev/null
+				sleep 10
+				continue
+			fi
+
+			wait_answer; rc=$?
+			case $rc in
+				0)
+					log "answered"
+					play_message $msg
+					press_button "$cfg[ui_end_button]" && log "hung up"
+					return 0 ;;
+				1)
+					log "call failed"
+					phone_sheet dismiss >/dev/null
+					sleep 10 ;;
+				2)
+					log "no answer within $cfg[answer_timeout]s"
+					press_button "$cfg[ui_end_button]"
+					return 2 ;;
+			esac
+		done
+		log "giving up on $number"
+		return 1
+	} always {
+		restore_audio
+	}
+}
+
+# ---------- shared option handling ----------
+
+# Parses call options from "$@" into opt_* globals and leaves positionals in `rest`.
+parse_call_opts() {
+	local -a o_msg o_file o_voice o_repeat o_timeout o_here o_date o_help
+	zparseopts -D -E -F -- \
+		m:=o_msg -message:=o_msg \
+		f:=o_file -message-file:=o_file \
+		v:=o_voice -voice:=o_voice \
+		r:=o_repeat -repeat:=o_repeat \
+		t:=o_timeout -timeout:=o_timeout \
+		-date:=o_date \
+		-here=o_here \
+		h=o_help -help=o_help || exit 1
+	rest=("$@")
+	opt_help=${#o_help}
+	opt_here=${#o_here}
+	opt_date=${o_date[-1]:-}
+	opt_text=${o_msg[-1]:-}
+	opt_file=${o_file[-1]:-}
+	(( ${#o_voice} )) && cfg[voice]=$o_voice[-1]
+	if (( ${#o_repeat} )); then
+		is_uint $o_repeat[-1] && (( o_repeat[-1] > 0 )) || die "--repeat needs a positive number"
+		cfg[repeat]=$o_repeat[-1]
+	fi
+	if (( ${#o_timeout} )); then
+		is_uint $o_timeout[-1] && (( o_timeout[-1] > 0 )) || die "--timeout needs a number of seconds"
+		cfg[answer_timeout]=$o_timeout[-1]
+	fi
+	if [[ -n $opt_date ]]; then
+		[[ $opt_date =~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' ]] || die "--date needs YYYY-MM-DD"
+	fi
+	return 0
+}
+
+# Prints the path of the message file to use, or nothing for a dial-only call.
+resolve_message() {
+	[[ -n $opt_text && -n $opt_file ]] && die "pass either a message or a message file, not both"
+	if [[ -n $opt_text ]]; then
+		mkdir -p $STATE_DIR
+		local tmp=$(mktemp $STATE_DIR/msg.XXXXXX)
+		print -r -- $opt_text > $tmp
+		print -r -- $tmp
+	elif [[ -n $opt_file ]]; then
+		[[ -s $opt_file ]] || die "message file '$opt_file' is missing or empty"
+		print -r -- ${opt_file:A}
+	fi
+}
+
+preflight() {
+	require_sas
+	has_accessibility || die "your terminal needs Accessibility permission (System Settings > Privacy & Security > Accessibility). Run 'ringer doctor' for details."
+	[[ -d /System/Applications/Phone.app ]] || warn "Phone.app not found; ringer is built for macOS 26 or later"
+}
+
+# ---------- commands ----------
+
+cmd_call() {
+	parse_call_opts "$@"
+	(( opt_help )) && { usage_call; return 0 }
+	(( ${#rest} == 1 || ${#rest} == 2 )) || { usage_call >&2; return 1 }
+	if (( ${#rest} == 2 )); then
+		[[ -z $opt_text ]] || die "pass the message once, either as an argument or with -m"
+		opt_text=$rest[2]
+	fi
+	local number
+	number=$(normalize_number $rest[1]) || die "'$rest[1]' doesn't look like a phone number"
+	preflight
+	local msg
+	msg=$(resolve_message) || exit 1
+	[[ $msg == "$STATE_DIR"/msg.* ]] && TMP_FILES+=($msg)
+	do_call $number $msg
+}
+
+cmd_schedule() {
+	parse_call_opts "$@"
+	(( opt_help )) && { usage_schedule; return 0 }
+	(( ${#rest} >= 2 )) || { usage_schedule >&2; return 1 }
+	local number epoch w
+	number=$(normalize_number $rest[1]) || die "'$rest[1]' doesn't look like a phone number"
+	local -a times
+	for w in $rest[2,-1]; do
+		epoch=$(parse_when $w $opt_date) || die "can't read time '$w'. Use HH:MM or 'YYYY-MM-DD HH:MM'"
+		(( epoch > $(date +%s) )) || die "$w is in the past"
+		times+=($epoch)
+	done
+	times=(${(nou)times})
+	preflight
+
+	local id=$(date +%Y%m%d-%H%M%S)-$RANDOM
+	mkdir -p $JOBS_DIR
+	local msg
+	msg=$(resolve_message) || exit 1
+	if [[ -n $msg ]]; then
+		cp $msg $JOBS_DIR/$id.msg
+		[[ $msg == "$STATE_DIR"/msg.* ]] && rm -f $msg
+		msg=$JOBS_DIR/$id.msg
+	fi
+	{
+		print -r -- "number = $number"
+		print -r -- "times = ${(j: :)times}"
+		print -r -- "message = $msg"
+		print -r -- "voice = $cfg[voice]"
+		print -r -- "repeat = $cfg[repeat]"
+		print -r -- "answer_timeout = $cfg[answer_timeout]"
+	} > $JOBS_DIR/$id.job
+
+	print "Scheduled $id: calling $number at"
+	local t
+	for t in $times; print "  $(fmt_time $t)"
+
+	if (( ! opt_here )) && open_runner $id; then
+		print "It's waiting in a new ${TERM_PROGRAM%.app} window. Leave that window open until the last call."
+	else
+		(( opt_here )) || print "Can't open a window in this terminal, so it'll wait here instead."
+		cmd_wait $id
+	fi
+}
+
+# Opens a new window in the current terminal app that runs `ringer _wait <id>`.
+open_runner() {
+	local cmd="exec ${(q)RINGER_SELF} _wait ${(q)1}"
+	case ${TERM_PROGRAM:-} in
+		iTerm.app)
+			osascript - "$cmd" >/dev/null <<'EOF'
+on run argv
+	tell application "iTerm2"
+		set w to (create window with default profile)
+		tell current session of w to write text (item 1 of argv)
+	end tell
+end run
+EOF
+			;;
+		Apple_Terminal)
+			osascript - "$cmd" >/dev/null <<'EOF'
+on run argv
+	tell application "Terminal"
+		do script (item 1 of argv)
+		activate
+	end tell
+end run
+EOF
+			;;
+		*) return 1 ;;
+	esac
+}
+
+typeset -A job
+set_job() { job[$1]=$2 }
+
+cmd_wait() {
+	local id=$1 jf=$JOBS_DIR/$1.job
+	[[ -r $jf ]] || die "no scheduled job '$id'"
+	job=()
+	parse_kv $jf set_job
+	[[ -n $job[voice] ]] && cfg[voice]=$job[voice]
+	[[ -n $job[repeat] ]] && cfg[repeat]=$job[repeat]
+	[[ -n $job[answer_timeout] ]] && cfg[answer_timeout]=$job[answer_timeout]
+	print $$ > $JOBS_DIR/$id.pid
+	caffeinate -dims -w $$ &!
+	print -n "\e]0;ringer: calls to $job[number]\a"
+
+	local -a times=(${=job[times]}) left
+	print "ringer $id: calling $job[number] at ${(j:, :)${(@f)$(for t in $times; fmt_time $t)}}"
+	print "Keep this window open and the Mac unlocked. Press Ctrl-C to cancel.\n"
+	log "schedule $id started for $job[number]"
+
+	local i t
+	for i in {1..${#times}}; do
+		t=$times[i]
+		if (( t < $(date +%s) - 60 )); then
+			log "skipping $(fmt_time $t), it already passed"
+			continue
+		fi
+		log "next call at $(fmt_time $t)"
+		# Short sleeps against the wall clock, so a paused sleep() can't make a call late.
+		while (( $(date +%s) < t )); do sleep 5; done
+		do_call $job[number] $job[message]
+		left=(${times[i+1,-1]})
+		{ grep -v '^times' $jf; print -r -- "times = ${(j: :)left}" } > $jf.tmp && mv $jf.tmp $jf
+	done
+	log "schedule $id finished"
+	rm -f $jf $JOBS_DIR/$id.pid $JOBS_DIR/$id.msg
+}
+
+cmd_list() {
+	local jf id pid state t
+	local -a files=($JOBS_DIR/*.job(N))
+	(( ${#files} )) || { print "No scheduled calls."; return 0 }
+	for jf in $files; do
+		id=${jf:t:r}
+		job=()
+		parse_kv $jf set_job
+		pid=""
+		[[ -r $JOBS_DIR/$id.pid ]] && pid=$(<$JOBS_DIR/$id.pid)
+		if [[ -n $pid ]] && kill -0 $pid 2>/dev/null; then state=waiting; else state="stopped (window closed?)"; fi
+		print "$id  $job[number]  $state"
+		for t in ${=job[times]}; print "    $(fmt_time $t)"
+	done
+}
+
+cmd_cancel() {
+	(( $# )) || die "usage: ringer cancel <id>... | --all"
+	local -a ids
+	if [[ $1 == --all ]]; then
+		ids=($JOBS_DIR/*.job(N:t:r))
+	else
+		ids=("$@")
+	fi
+	local id pid
+	for id in $ids; do
+		[[ -e $JOBS_DIR/$id.job ]] || { warn "no scheduled job '$id'"; continue }
+		pid=""
+		[[ -r $JOBS_DIR/$id.pid ]] && pid=$(<$JOBS_DIR/$id.pid)
+		[[ -n $pid ]] && kill $pid 2>/dev/null
+		rm -f $JOBS_DIR/$id.{job,pid,msg}
+		log "cancelled $id"
+	done
+}
+
+cmd_log() {
+	[[ -r $LOG_FILE ]] || { print "No log yet."; return 0 }
+	if [[ ${1:-} == (-f|--follow) ]]; then
+		tail -f $LOG_FILE
+	else
+		tail -n ${1:-40} $LOG_FILE
+	fi
+}
+
+# Prints a numbered menu of $2.. and stores the choice in REPLY. $1 is the prompt, $default the preselection.
+choose() {
+	local prompt=$1; shift
+	local -a items=("$@")
+	local i
+	for i in {1..${#items}}; do
+		if [[ $items[i] == "$default" ]]; then print "  $i) $items[i]  (current)"; else print "  $i) $items[i]"; fi
+	done
+	while true; do
+		read "REPLY?$prompt "
+		[[ -z $REPLY && -n $default ]] && { REPLY=$default; return 0 }
+		if [[ $REPLY == <-> ]] && (( REPLY >= 1 && REPLY <= ${#items} )); then
+			REPLY=$items[REPLY]
+			return 0
+		fi
+		print "Pick a number from 1 to ${#items}."
+	done
+}
+
+# Plays a phrase on the speaker, records it with the mic and prints the peak level in dB.
+measure_pickup() {
+	local mic=$1 speaker=$2 wav=$STATE_DIR/setup-test.wav
+	mkdir -p $STATE_DIR
+	local before=$($SAS -c -t output) vol
+	$SAS -t output -s "$speaker" >/dev/null; vol=$(get_volume); set_volume 100
+	$SAS -t output -s "$before" >/dev/null
+	local -a vopt
+	[[ -n $cfg[voice] ]] && vopt=(-v $cfg[voice])
+	( sleep 1; say $vopt -a "$speaker" "This is a ringer microphone test. One, two, three." ) &
+	ffmpeg -hide_banner -loglevel error -y -f avfoundation -i ":$mic" -t 6 $wav 2>/dev/null
+	wait
+	$SAS -t output -s "$speaker" >/dev/null; set_volume $vol
+	$SAS -t output -s "$before" >/dev/null
+	ffmpeg -hide_banner -i $wav -af volumedetect -f null - 2>&1 | sed -n 's/.*max_volume: \(-*[0-9.]*\) dB.*/\1/p'
+	rm -f $wav
+}
+
+cmd_setup() {
+	print "ringer setup\n"
+	require_sas
+
+	if ! has_accessibility; then
+		print "Your terminal app needs Accessibility permission so ringer can press Call and End."
+		print "Opening System Settings. Turn on your terminal app under Accessibility, then come back."
+		open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+		read "?Press Return when done... "
+		has_accessibility || die "still no Accessibility permission. You may need to restart the terminal app."
+	fi
+	print "Accessibility: ok\n"
+
+	print "ringer plays the message out loud on one speaker and a microphone picks it up for the call."
+	print "The call's own audio must go to a different output, or macOS turns the message down and filters it out.\n"
+
+	local -a inputs=("${(@f)$(list_devices input)}") outputs=("${(@f)$(list_devices output)}")
+	local default
+
+	print "Which microphone should pick up the message?"
+	default=$cfg[mic]; choose "Microphone:" $inputs; cfg[mic]=$REPLY
+	[[ $cfg[mic] == *MacBook* ]] && print "Note: a MacBook's built-in mic is switched off while the lid is closed."
+
+	print "\nWhich speaker should play the message?"
+	default=$cfg[speaker]; choose "Message speaker:" $outputs; cfg[speaker]=$REPLY
+
+	local -a others=(${outputs:#${(b)cfg[speaker]}})
+	(( ${#others} )) || die "you need at least two audio outputs: one for the message and one for the call"
+	print "\nWhere should the call's own audio go? It has to differ from the message speaker."
+	default=$cfg[call_output]; choose "Call audio:" $others; cfg[call_output]=$REPLY
+
+	print
+	read "REPLY?Voice for the message (blank for the system voice; list them with: say -v '?') [${cfg[voice]:-system}]: "
+	[[ -n $REPLY ]] && cfg[voice]=$REPLY
+
+	if command -v ffmpeg >/dev/null; then
+		while true; do
+			print "\nTesting: playing a phrase on '$cfg[speaker]' and listening with '$cfg[mic]'..."
+			local peak=$(measure_pickup "$cfg[mic]" "$cfg[speaker]")
+			if [[ -z $peak ]]; then
+				print "Couldn't record from '$cfg[mic]'. Your terminal may also need Microphone permission."
+			elif (( peak > -35 )); then
+				print "The mic heard it (peak ${peak} dB). Good."
+				break
+			else
+				print "The mic barely heard it (peak ${peak} dB). Move them closer or turn the speaker up."
+			fi
+			read "REPLY?Try again? [Y/n] "
+			[[ $REPLY == [nN]* ]] && break
+		done
+	else
+		print "\nInstall ffmpeg (brew install ffmpeg) and ringer can check that the mic hears the speaker."
+	fi
+
+	write_config
+	print "\nSaved $CONFIG_FILE"
+	print "Try it on your own number:  ringer call +15551234567 \"This is a test\""
+}
+
+cmd_doctor() {
+	local bad=0
+	ok() { print "  ✓ $*" }
+	no() { print "  ✗ $*"; bad=1 }
+	maybe() { print "  - $*" }
+
+	print "System"
+	local ver=$(sw_vers -productVersion)
+	if (( ${ver%%.*} >= 26 )); then ok "macOS $ver"; else no "macOS $ver (ringer needs 26 or later for the Phone app)"; fi
+	[[ -d /System/Applications/Phone.app ]] && ok "Phone.app" || no "Phone.app not found"
+	[[ -x $SAS ]] && ok "SwitchAudioSource" || no "SwitchAudioSource missing (brew install switchaudio-osx)"
+	command -v ffmpeg >/dev/null && ok "ffmpeg (used by setup)" || maybe "ffmpeg not installed (optional, used by setup)"
+	has_accessibility && ok "Accessibility permission for ${TERM_PROGRAM:-this terminal}" \
+		|| no "no Accessibility permission for ${TERM_PROGRAM:-this terminal} (System Settings > Privacy & Security > Accessibility)"
+
+	print "\nConfig ($CONFIG_FILE)"
+	if [[ ! -r $CONFIG_FILE ]]; then
+		no "not found, run 'ringer setup'"
+	elif [[ -x $SAS ]]; then
+		[[ -n $cfg[mic] ]] && { device_exists input "$cfg[mic]" && ok "mic '$cfg[mic]'" || no "mic '$cfg[mic]' not connected" } || no "no mic set"
+		[[ -n $cfg[speaker] ]] && { device_exists output "$cfg[speaker]" && ok "message speaker '$cfg[speaker]'" || no "speaker '$cfg[speaker]' not connected" } || no "no message speaker set"
+		if [[ -n $cfg[call_output] ]]; then
+			device_exists output "$cfg[call_output]" && ok "call audio '$cfg[call_output]'" || no "call audio device '$cfg[call_output]' not connected"
+			[[ $cfg[call_output] != "$cfg[speaker]" ]] || no "call audio and message speaker are the same device"
+		fi
+	fi
+
+	print "\nThings ringer can't check"
+	maybe "iPhone nearby, same Apple ID and Wi-Fi, 'Calls on Other Devices' allowed for this Mac"
+	maybe "no VPN on the Mac or iPhone (it breaks Continuity calls)"
+	maybe "the Mac stays unlocked while calls are scheduled"
+	return $bad
+}
+
+# ---------- usage ----------
+
+usage() {
+	cat <<EOF
+ringer $RINGER_VERSION: place calls from the macOS Phone app and speak a message when they're answered.
+
+Usage:
+  ringer setup                          Pick the mic and speakers and test them
+  ringer call <number> [message]        Call now. With a message, say it when answered;
+                                        without one, just dial and talk yourself
+  ringer schedule <number> <time>... [options]
+                                        Call at each time (HH:MM or "YYYY-MM-DD HH:MM")
+  ringer list                           Show scheduled calls
+  ringer cancel <id>... | --all         Cancel scheduled calls
+  ringer log [-f | N]                   Show the last N log lines, or follow the log
+  ringer doctor                         Check permissions, devices and config
+
+Options for call and schedule (no message means ringer only dials):
+  -m, --message TEXT       Say TEXT once the call is answered
+  -f, --message-file FILE  Say the contents of FILE
+  -v, --voice NAME         Voice for the message (see: say -v '?')
+  -r, --repeat N           Say the message N times (default $cfg[repeat])
+  -t, --timeout SECS       Give up if nobody answers in SECS (default $cfg[answer_timeout])
+      --date YYYY-MM-DD    Day for bare HH:MM times (schedule only)
+      --here               Wait in this terminal instead of a new window (schedule only)
+
+Config: $CONFIG_FILE
+Log:    $LOG_FILE
+EOF
+}
+
+usage_call() {
+	print "Usage: ringer call <number> [message] [-f FILE] [-v VOICE] [-r N] [-t SECS]"
+	print "  Without a message, ringer dials and leaves the call to you."
+}
+
+usage_schedule() {
+	print "Usage: ringer schedule <number> <time>... [--date YYYY-MM-DD] [--here] [-m TEXT | -f FILE] [-v VOICE] [-r N] [-t SECS]"
+	print "  Times are HH:MM (next occurrence) or \"YYYY-MM-DD HH:MM\"."
+}
+
+# ---------- main ----------
+
+cleanup() {
+	restore_audio
+	(( ${#TMP_FILES} )) && rm -f $TMP_FILES
+}
+
+ringer_main() {
+	load_config
+	local cmd=${1:-help}
+	(( $# )) && shift
+	case $cmd in
+		call) cmd_call "$@" ;;
+		schedule) cmd_schedule "$@" ;;
+		_wait) cmd_wait "$@" ;;
+		list|ls) cmd_list ;;
+		cancel) cmd_cancel "$@" ;;
+		log) cmd_log "$@" ;;
+		setup) cmd_setup ;;
+		doctor) cmd_doctor ;;
+		-V|--version|version) print "ringer $RINGER_VERSION" ;;
+		help|-h|--help) usage ;;
+		*) warn "unknown command '$cmd'"; usage >&2; return 1 ;;
+	esac
+}
+
+if [[ -z ${RINGER_SOURCE_ONLY:-} ]]; then
+	trap cleanup EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	ringer_main "$@"
+fi
